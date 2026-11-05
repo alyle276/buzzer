@@ -45,6 +45,10 @@
   #preview { max-width: 160px; max-height: 120px; border-radius: 8px; border: 1px solid var(--line); display: none; }
   #log { font: .8rem/1.4 ui-monospace, Menlo, Consolas, monospace; color: var(--muted); max-height: 180px; overflow: auto; margin: 8px 0 0; padding: 0; list-style: none; }
   .hint { color: var(--muted); font-size: .85rem; }
+  .zoomrow { margin: 10px 0 0; }
+  .zoomrow label { display: flex; justify-content: space-between; margin: 0 0 4px; }
+  input[type=range] { width: 100%; height: 36px; accent-color: var(--accent); }
+  .video-wrap video { transform-origin: center center; }
   .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 </style>
 </head>
@@ -58,6 +62,10 @@
 </div>
 
 <div class="video-wrap"><video id="video" autoplay playsinline muted></video></div>
+<div class="zoomrow" id="zoomRow" hidden>
+  <label for="zoom"><span>Zoom</span> <span id="zoomVal">1.0x</span></label>
+  <input type="range" id="zoom" min="1" max="4" step="0.1" value="1">
+</div>
 
 <div class="result">
   <div id="answer" aria-hidden="true">-</div>
@@ -165,6 +173,7 @@ let busy = false, learning = '';                 // learning: '' | 'trigger' | '
 let triggerKey = store.get('triggerKey', '');
 let repeatKey = store.get('repeatKey', '');
 let lastCode = '';                               // last A-E answer, for "repeat"
+let zoomMode = 'none', digitalZoom = 1;          // 'hardware' | 'digital' | 'none'
 
 function log(msg) {
   const li = document.createElement('li');
@@ -286,11 +295,12 @@ function repeatLast() {
 async function startCamera() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 2560 }, height: { ideal: 1440 } },
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
       audio: false
     });
     $('video').srcObject = stream;
     await $('video').play().catch(() => {});
+    setupZoom();
     await keepAwake();
     updatePills();
     setStatus('Camera on. Aim it at the question, then press the pedal.', 'ok');
@@ -307,22 +317,68 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && stream) keepAwake();
 });
 
+// Zoom: use the camera's real zoom when Chrome exposes it, otherwise crop digitally.
+function setupZoom() {
+  const track = stream && stream.getVideoTracks()[0];
+  const caps = (track && track.getCapabilities) ? track.getCapabilities() : {};
+  const slider = $('zoom');
+  digitalZoom = 1; $('video').style.transform = '';
+  if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+    zoomMode = 'hardware';
+    slider.min = caps.zoom.min; slider.max = Math.min(caps.zoom.max, 10);
+    slider.step = caps.zoom.step || 0.1; slider.value = caps.zoom.min;
+  } else {
+    zoomMode = 'digital';
+    slider.min = 1; slider.max = 4; slider.step = 0.1; slider.value = 1;
+  }
+  $('zoomVal').textContent = Number(slider.value).toFixed(1) + 'x';
+  $('zoomRow').hidden = false;
+  log('Zoom mode: ' + zoomMode);
+}
+
+async function applyZoom() {
+  const v = Number($('zoom').value);
+  $('zoomVal').textContent = v.toFixed(1) + 'x';
+  if (zoomMode === 'hardware') {
+    try { await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ zoom: v }] }); return; }
+    catch (e) { log('Camera zoom refused (' + e.message + '), using digital zoom instead.'); zoomMode = 'digital'; }
+  }
+  digitalZoom = v;
+  $('video').style.transform = 'scale(' + v + ')';
+}
+$('zoom').addEventListener('input', applyZoom);
+
 function grabFrame(maxSide = 1600, quality = 0.85) {
   const v = $('video');
   if (!stream || !v.videoWidth) throw new Error('Camera is not running. Tap "Start camera".');
-  const scale = Math.min(1, maxSide / Math.max(v.videoWidth, v.videoHeight));
+  // Digital zoom (used only when the camera has no hardware zoom): crop the centre of the frame.
+  const z = zoomMode === 'digital' ? digitalZoom : 1;
+  const sw = v.videoWidth / z, sh = v.videoHeight / z;
+  const sx = (v.videoWidth - sw) / 2, sy = (v.videoHeight - sh) / 2;
+  const scale = Math.min(1, maxSide / Math.max(sw, sh));
   const c = document.createElement('canvas');
-  c.width = Math.round(v.videoWidth * scale);
-  c.height = Math.round(v.videoHeight * scale);
-  c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+  c.width = Math.round(sw * scale);
+  c.height = Math.round(sh * scale);
+  c.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', quality);
 }
 
 // ---- Gemini ---------------------------------------------------------------
+// The key goes into an HTTP header, so it may only hold plain visible characters.
+// A "..." copied from AI Studio's hidden-key display breaks it.
+function getKey() {
+  const raw = $('apiKey').value.trim();
+  if (!raw) throw new Error('Add your Gemini API key under Settings.');
+  if (/[^\x21-\x7E]/.test(raw)) {
+    throw new Error('The key has characters that cannot be part of a key, such as "…" or a space inside it. ' +
+      'In Google AI Studio use the copy button to copy the whole key, then paste it again.');
+  }
+  return raw;
+}
+
 async function askGemini(dataUrl) {
-  const key = $('apiKey').value.trim();
+  const key = getKey();
   const model = ($('model').value.trim() || DEFAULT_MODEL);
-  if (!key) throw new Error('Add your Gemini API key under Settings.');
 
   const body = {
     contents: [{ parts: [
@@ -364,8 +420,8 @@ async function askGemini(dataUrl) {
 }
 
 async function refreshModels() {
-  const key = $('apiKey').value.trim();
-  if (!key) { setStatus('Enter your API key first.', 'warn'); return; }
+  let key;
+  try { key = getKey(); } catch (e) { setStatus(e.message, 'warn'); return; }
   try {
     const r = await fetch(API_BASE + '/models?pageSize=200', { headers: { 'x-goog-api-key': key } });
     const j = await r.json();
